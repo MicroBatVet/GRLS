@@ -213,7 +213,6 @@ params <- list(
 
 #Define parameters based upon gridsearch results (code for this step further below): 
 #"Best parameters: learning_rate: 0.1, min_data_in_leaf: 100, max_depth: -1, num_leaves: 512, lambda_l2: 0, max_bin: 250, tree_learner: serial, line_search_step_length: TRUE"
-
 params <- list(
   learning_rate = 0.1,
   min_data_in_leaf = 100,
@@ -339,4 +338,186 @@ shap.plot.dependence(data_long = shap_long_nocancer, x = "DP05_Asian",
 
 shap.plot.dependence(data_long = shap_long_nocancer, x = "S2701_NoHealthCareCoverage",
                      color_feature = "DP05_Hispanic_Latino", smooth = FALSE)
+
+###############################################################################
+##Now create a model for dog's with cancer
+#Find the list of subject_ids per frequency and split 70% / 30% or 50% / 50%, base upon model performance
+train_subjects_cancer1 <- df1_sdh_nonas_cancer %>%
+  distinct(subject_id, frequency) %>%
+  group_by(frequency) %>%
+  group_split() %>%
+  lapply(function(df_group) {
+    n_train <- ceiling(0.7 * nrow(df_group))  # take 70%
+    sample(df_group$subject_id, size = n_train)
+  }) %>%
+  unlist()
+
+#Define your full subject IDs
+all_subjects_cancer1 <- unique(df1_sdh_nonas_cancer$subject_id)
+
+#Get test_subjects as all others not in training
+test_subjects_cancer1 <- setdiff(all_subjects_cancer1, train_subjects_cancer1)
+
+#Now create the actual training and testing datasets
+train_data_cancer1 <- df1_sdh_nonas_cancer %>%
+  filter(subject_id %in% train_subjects_cancer1)
+
+test_data_cancer1 <- df1_sdh_nonas_cancer %>%
+  filter(subject_id %in% test_subjects_cancer1)
+
+#Separate variables and target variable
+trainx_cancer <- train_data_cancer1 %>%
+  dplyr::select(-frequency, -subject_id)
+
+trainy_cancer <- train_data_cancer1$frequency  # Convert to vector
+
+testx_cancer <- test_data_cancer1 %>%
+  dplyr::select(-frequency, -subject_id)
+
+testy_cancer <- test_data_cancer1$frequency  # Convert to vector
+
+# Create GPBoost model
+gp_model <- GPModel(
+  likelihood = "poisson",
+  group_data = train_data_cancer1$subject_id,
+  cluster_ids = train_data_cancer1$subject_id
+)
+
+# Define parameters
+params <- list(
+  learning_rate = 0.01,
+  min_data_in_leaf = 20,
+  max_depth = 20,
+  num_leaves = 100,
+  lambda_l2 = 0,
+  max_bin = 250,
+  line_search_step_length = TRUE
+)
+
+#Define parameters based upon gridsearch results: 
+#Didn't replace parames as didn't beat original ones above.
+# Important point as if model performance does not improve, then you should not accept the gridsearch results.
+params <- list(
+  learning_rate = 0.001,
+  min_data_in_leaf = 1,
+  max_depth = 15,
+  num_leaves = 64,
+  lambda_l2 = 1,
+  max_bin = 500,
+  line_search_step_length = TRUE
+)
+
+#Train model (NO SCALING)
+freq1Modelcancer <- gpb.Dataset(data = as.matrix(trainx_cancer), label = trainy_cancer)
+cancer1_freq <- gpb.train(data = freq1Modelcancer, gp_model = gp_model, nrounds = 1000, params = params) #Change number of rounds as needed.
+
+
+#Predict on test data
+pred_resp_freqcancer <- predict(
+  cancer1_freq,
+  data = as.matrix(testx_cancer),
+  group_data_pred = test_data_cancer1$subject_id,  # FIXED
+  predict_var = TRUE,
+  pred_latent = FALSE,  # Ensure response prediction
+  cluster_ids_pred = test_data_cancer1$subject_id
+)
+
+
+# Extract response predictions
+predictedcancer <- (pred_resp_freqcancer$response_mean)  
+
+# Evaluate predictions, will calculate McFaddon's R2 for poisson model below after null model calculations
+mse <- mean((testy_cancer - predictedcancer)^2)
+rmse <- sqrt(mse)
+
+cat("MSE:", mse, "\nRMSE:", rmse)
+
+
+# null GP model
+gp_model_null <- GPModel(
+  likelihood = "poisson",
+  group_data = train_data_cancer1$subject_id,
+  cluster_ids = train_data_cancer1$subject_id
+)
+
+# Define Null model with no predictors
+dataset_null <- gpb.Dataset(data = matrix(0, nrow = nrow(trainx_cancer), ncol = 1), label = trainy_cancer)
+
+# Define hyperparameters with minimal tree boosting.
+params_null <- list(
+  objective = "poisson",
+  learning_rate = 0.01,
+  max_depth = 1,  # Min depth to avoid learning the x features
+  num_leaves = 2  # Min tree
+)
+
+# Train the null model 
+bst_null <- gpb.train(
+  data = dataset_null,
+  gp_model = gp_model_null,
+  nrounds = 1,  
+  params = params_null
+)
+
+
+# Predict from null model
+pred_null <- predict(
+  bst_null,
+  data = matrix(1, nrow = nrow(testx_cancer), ncol = 1),  # Intercept-only model
+  group_data_pred = test_data_cancer1$subject_id,  # Provide group data
+  cluster_ids_pred = test_data_cancer1$subject_id
+)$response_mean
+
+
+# Compute log-likelihood of the null model
+logL_null <- sum(testy_cancer * log(pred_null) - pred_null - lgamma(testy_cancer + 1))
+logL_model <- sum(testy_cancer * log(predictedcancer) - predictedcancer - lgamma(testy_cancer + 1))
+
+# McFadden's R²
+R2_McFadden <- 1 - (logL_model / logL_null)
+
+cat("McFadden's R²:", R2_McFadden)
+
+#Now try to evaluate likilihoods and parameters via grid search.
+#Try to build better model by assessing parameters via grid search
+param_grid <- list("learning_rate" = c(0.001, 0.01, 0.1, 1), 
+                   "min_data_in_leaf" = c(1, 10, 100),
+                   "max_depth" = c(-1, 1, 5, 10, 15, 20), # -1 means no depth limit as we tune 'num_leaves'
+                   "num_leaves" = 2^(1:10),
+                   "lambda_l2" = c(0, 1, 10, 100),
+                   "max_bin" = c(250, 500, 1000, min(50,10000)),
+                   "tree_learner" = c("serial", "data_parallel"),
+                   "line_search_step_length" = c(TRUE, FALSE))
+metric = c("average_precision", "mse") # Define metric, "mse", "average_precision", "auc" for guassian. binary_logloss
+
+# Note: can also use metric = "test_neg_log_likelihood". For more options, see https://github.com/fabsig/GPBoost/blob/master/docs/Parameters.rst#metric-parameters
+# Run parameter optimization using random grid search and k-fold CV
+# Note: deterministic grid search can be done by setting 'num_try_random=NULL'
+opt_params_freq <- gpb.grid.search.tune.parameters(param_grid = param_grid,
+                                                   data = freq1Modelcancer, gp_model = gp_model,
+                                                   num_try_random = 100, nfold = 5,
+                                                   nrounds = 1000, early_stopping_rounds = 20,
+                                                   verbose_eval = 1, metric = metric, cv_seed = 4,
+                                                   num_threads=12, seed = 18)
+print(paste0("Best parameters: ", paste0(unlist(lapply(seq_along(opt_params_pace$best_params), 
+                                                       function(y, n, i) { paste0(n[[i]],": ", y[[i]]) }, y=opt_params_freq$best_params, 
+                                                       n=names(opt_params_freq$best_params))), collapse=", ")))
+print(paste0("Best number of iterations: ", opt_params_freq$best_iter))
+print(paste0("Best score: ", round(opt_params_freq$best_score, digits=3)))
+
+#SHAP values
+# Calculate SHAP values and summary plot for the cancer model
+shap_long_cancer <- shap.prep(
+  xgb_model = cancer1_freq,
+  X_train = as.matrix(trainx_cancer),
+  top_n = 15       # Select the top x most important features
+)
+
+shap_values_freqcancer <- shap.values(xgb_model = cancer1_freq, X_train = as.matrix(trainx_cancer))
+
+# **SHAP summary plot**
+shap.plot.summary(shap_long_cancer, dilute = 10) 
+shap_values_frequency_cancer <- shap_values_cancer$shap_score
+
+#This code was adapted for each GPBoost Poisson model created for the manuscript.  The total code was 3,411 lines.
 
